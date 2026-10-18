@@ -13,11 +13,13 @@ interface StationResponse {
   photo_url?: string | null
   id: string
   owner_id: string
+  timezone: string
   name: string
   address: string
   latitude: number
   longitude: number
   status: StationStatus
+  status_version: number
   created_at: string
   updated_at: string
 }
@@ -49,11 +51,13 @@ export class StationApiError extends Error {
 function mapStation(response: StationResponse): Station {
   return {
     id: response.id,
+    timezone: response.timezone,
     name: response.name,
     address: response.address,
     latitude: response.latitude,
     longitude: response.longitude,
     status: response.status,
+    statusVersion: response.status_version,
     createdAt: response.created_at,
     updatedAt: response.updated_at,
     photoUrl: response.photo_url,

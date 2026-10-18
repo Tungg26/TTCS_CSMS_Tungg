@@ -150,6 +150,10 @@ Heading sizes tighten to (26px) for the compact desktop height rule and (24px) o
 
 ## Layout
 
+Equipment and tariffs are separate sidebar destinations, without a local section selector. Equipment keeps the grid, station operation and status; tariffs show only the selected station name, tariff history and create/edit form. The tariff station picker omits status filters and badges; equipment and connection data are not fetched on the tariff screen. The no-show fee policy follows the tariff form in the same scroll region. Sidebar navigation retains the selected station.
+
+Tariff history is a native disclosure, collapsed initially, with its version count visible in a compact summary (44px touch target plus 8px vertical padding). Expanding reveals the version list and pagination; the current tariff and create/edit form remain outside the disclosure. Its summary supports keyboard activation and the workspace focus styling.
+
 The desktop shell fills (100dvh), hides outer overflow and uses a (220px) sidebar plus a flexible main column. Pages are flex columns; base padding is (26px 30px 22px) with (16px) gaps, overridden on desktop (width above 800px) by (20px 24px 16px) padding and (12px) gaps. Selected-session pages tighten the gap to (8px). Long station lists, charger grids, detail panes and wizard content scroll internally; flexible regions set `min-height: 0`. Scroll containers contain overscroll. Headers and action footers remain separate from these regions.
 
 Station and charger grids start at three columns. Detail uses a flexible equipment region and a second column of `minmax(280px, 31%)`. Wizard columns are (0.9fr / 1.1fr) with a (32px) gap. Sessions use two-column card grids, and session facts use four columns. These are workspace patterns, not mandatory page compositions for other roles.
@@ -202,6 +206,10 @@ Connectors form a four-column strip, with (6px) gaps and (40px) minimum-height b
 
 Wizard steps use numbered circles and a green current step. Review summaries and meter pairs use pale tonal blocks. Measurements keep units, labels and timestamps; nominal equipment metadata is a separate disclosure. Selected-session details refresh after the session closes rather than retaining open-session facts. Open-session delivered energy is the nonnegative latest-meter/start-meter delta; closed sessions use final energy. Latest aggregate power, temperature, voltage and current appear with units, timestamps and location independently of the inspected older sample page. Missing readings retain their explicit unavailable state. Photo and card validation messages identify their own action and fields rather than sharing an unrelated photo error. Connector-to-session navigation opens the exact backend session. Recovery history is keyed to the selected session and shows loading while changing sessions, preventing previous-session history from appearing as current. Cards identify expiration truthfully, and failed card actions retain their error until an actual retry rather than being cleared by background refresh. These are factual display requirements, not decorative variants.
 
+### Station power configuration
+
+StationPowerPage extends the incumbent owner Operate workspace with Segoe UI, restrained teal navigation and native controls. A station selector leads to saved requested/applied charging limits and total rated power, followed by draft limit/connector-rating fields, per-connector saved desired/confirmed/reserved budgets, commissioning attestations and save/enable/disable actions. Keep drafts separate from persisted facts: background refresh updates operational truth without replacing edits; saving uses the draft's configuration version, while control actions use the current snapshot. Switching stations clears previous facts, and pending mutations block selection and concurrent refresh results. Enable/disable acceptance remains asynchronous, with explicit transition, issue and retry feedback; enabling requires saved commissioning attestations and a verification note. The panel scrolls vertically within the owner shell, and the table retains a (540px) minimum width with horizontal scrolling inside its wrapper; mobile actions stack without document overflow. Recorded zero-limit/offline tests and notes are owner attestations; real-device commissioning acceptance remains a separate gate.
+
 ### Photos and icons
 
 Station photos are authenticated API content loaded into temporary blob URLs and released on cleanup. The upload control accepts JPEG, PNG and WebP with a (20MiB) byte limit and displayed (16 million pixel) limit; animated PNG/WebP use the first frame as the station cover. These are current upload constraints, not image-size design tokens. No photo, loading and failed loading have distinct visible states; a failed authenticated photo fetch offers an actionable retry rather than silently becoming the no-photo state. Card covers use `object-fit: cover`; wizard previews use `object-fit: contain`. The implementation ships authored SVG symbols and charger drawings; review screenshots and the isolated demo upload are not frontend raster assets. General owner icons are stroke-based (22px, 1.8 stroke width, rounded caps/joins); equipment drawings and charts have their own explicit dimensions and fills.
@@ -219,3 +227,20 @@ Station photos are authenticated API content loaded into temporary blob URLs and
 - **Don't** invent station imagery, zero readings or financial totals to fill missing data.
 - **Don't** remove focus indicators or leave closed mobile navigation keyboard-accessible.
 - **Don't** promote deferred capability placeholders, review screenshots or demo-only assets into a claimed completed product feature.
+
+Station operation actions use green with white text to enable a station and pale
+orange with dark orange text to suspend it, including the suspension confirmation.
+Labels remain explicit; the adjacent station-information action stays secondary.
+
+### Driver reservation actions
+
+In the driver connector view, the return-to-map action precedes the reservation
+list. The closed reservation disclosure is a single 44px row with horizontal
+padding only. The reservation trigger sits immediately after Start charging and
+before Refresh connector status, at the same full width as Start charging. Its
+explanatory copy and arrival/fee form appear in a native modal dialog after activation,
+with explicit confirmation/cancellation, focus containment and Escape/focus return.
+The trigger also initiates capability discovery when needed.
+Pending probes have bounded wait and explicit retry feedback. Keep own-hold and
+booking-confirmation facts visible, and preserve fee consent and persisted retry
+identity. Desktop and mobile follow the same DOM/focus order and existing palette.

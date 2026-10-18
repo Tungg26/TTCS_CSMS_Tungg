@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { AlertsPanel } from '../alerts/AlertsPanel'
 import type { AuthenticatedUser } from '../auth/model/auth'
 import type { StationApi } from '../stations/api/stationApi'
 import { HttpStationApi } from '../stations/api/httpStationApi'
@@ -18,6 +19,12 @@ import { Icon, type IconName } from '../../components/icons/Icon'
 import { StationWizard } from './StationWizard'
 import { ChargerWizard } from './ChargerWizard'
 import { OwnerCharging } from './OwnerCharging'
+import { TariffHistoryPanel } from './TariffHistoryPanel'
+import { StationSubscriptionPlans } from './StationSubscriptionPlans'
+import { StationPowerPage } from './StationPowerPage'
+import { OwnerRevenueReport } from './OwnerRevenueReport'
+import { StationOperation } from './StationOperation'
+import { ReservationPolicy } from './ReservationPolicy'
 import { ChargerDrawing, ConnectionSymbol, ConnectorSymbol, StationPhoto } from './OwnerVisuals'
 import {
   clock,
@@ -33,14 +40,27 @@ import './owner.css'
 
 const stationsApi = new HttpStationApi()
 const chargersApi = new HttpChargePointApi()
-type Area = 'stations' | 'charging' | 'tariffs' | 'revenue' | 'power'
+type Area = 'stations' | 'charging' | 'tariffs' | 'subscriptions' | 'revenue' | 'power'
 const navigation: { area: Area; label: string; icon: IconName }[] = [
   { area: 'stations', label: 'Trạm của tôi', icon: 'station' },
   { area: 'charging', label: 'Phiên sạc', icon: 'session' },
   { area: 'tariffs', label: 'Biểu giá', icon: 'report' },
+  { area: 'subscriptions', label: 'Gói thuê bao', icon: 'wallet' },
   { area: 'revenue', label: 'Doanh thu', icon: 'report' },
   { area: 'power', label: 'Công suất', icon: 'bolt' },
 ]
+
+function ownerRoute() {
+  const [path, query] = window.location.hash.slice(1).split('?')
+  return {
+    area: navigation.find(item => item.area === path)?.area ?? 'stations' as Area,
+    stationId: new URLSearchParams(query).get('station'),
+  }
+}
+
+function ownerHash(area: Area, stationId?: string | null) {
+  return `#${area}${stationId ? `?${new URLSearchParams({ station: stationId })}` : ''}`
+}
 
 export function Telemetry({
   charger,
@@ -194,7 +214,7 @@ export function Telemetry({
             <div>
               <span>Tiền tạm tính</span>
               <strong>—</strong>
-              <small>Chưa có biểu giá</small>
+              <small>Chưa có dữ liệu tạm tính</small>
             </div>
           </div>
           {Array.from(latest.values())
@@ -269,12 +289,14 @@ export function OwnerWorkspace({
   stationApi?: StationApi
   chargePointApi?: ChargePointApi
 }) {
-  const [area, setArea] = useState<Area>('stations')
+  const [area, updateArea] = useState<Area>(() => ownerRoute().area)
+  const [routeStationId, setRouteStationId] = useState(() => ownerRoute().stationId)
   const [stations, setStations] = useState<PaginatedResult<Station> | null>(
     null,
   )
   const [station, setStation] = useState<Station | null>(null)
   const [chargers, setChargers] = useState<ChargePointPage | null>(null)
+  const [chargerTotal, setChargerTotal] = useState<number | null>(null)
   const [connections, setConnections] = useState<Connection[]>([])
   const [connectionError, setConnectionError] = useState('')
   const [selected, setSelected] = useState<{
@@ -304,6 +326,35 @@ export function OwnerWorkspace({
   const menuRef = useRef<HTMLButtonElement>(null)
   const [loggingOut, setLoggingOut] = useState(false)
   const [logoutError, setLogoutError] = useState('')
+  function setArea(next: Area) {
+    updateArea(next)
+    window.location.assign(ownerHash(next, station?.id))
+  }
+  useEffect(() => {
+    const change = () => {
+      const route = ownerRoute()
+      updateArea(route.area)
+      setRouteStationId(route.stationId)
+      setSelected(null)
+      setForm(null)
+      setMenu(false)
+    }
+    window.addEventListener('hashchange', change)
+    return () => window.removeEventListener('hashchange', change)
+  }, [])
+  useEffect(() => {
+    if (!routeStationId) {
+      const timer = window.setTimeout(() => setStation(null), 0)
+      return () => window.clearTimeout(timer)
+    }
+    const controller = new AbortController()
+    void stationApi.getStation(routeStationId, controller.signal).then(value => {
+      if (!controller.signal.aborted) { setStation(value); setChargerPage(1); setChargerSearch('') }
+    }).catch(() => {
+      if (!controller.signal.aborted) setError('Không tải được trạm từ liên kết. Hãy thử lại.')
+    })
+    return () => controller.abort()
+  }, [routeStationId, stationApi, revision])
   const stationId = station?.id
   useEffect(() => {
     const query = window.matchMedia?.('(max-width: 800px)')
@@ -330,7 +381,7 @@ export function OwnerWorkspace({
     const timeout = window.setTimeout(() => {
       void stationApi
         .listStations(
-          { page, pageSize: 20, search, ...(status ? { status } : {}) },
+          { page, pageSize: 20, search, ...(area === 'stations' && status ? { status } : {}) },
           controller.signal,
         )
         .then((value) => {
@@ -355,21 +406,33 @@ export function OwnerWorkspace({
       controller.abort()
       window.clearTimeout(timeout)
     }
-  }, [stationApi, page, search, status, revision])
+  }, [stationApi, page, search, status, revision, area])
   useEffect(() => {
-    if (!stationId) return
+    if (!stationId || area !== 'stations') return
     const controller = new AbortController()
     let running = false
     async function load() {
       if (running) return
       running = true
       try {
-        const value = await chargePointApi.listChargePoints(
+        let value = await chargePointApi.listChargePoints(
           stationId!,
           chargerPage,
           20,
           controller.signal,
         )
+        if (!controller.signal.aborted) setChargerTotal(value.total)
+        if (chargerSearch.trim()) {
+          const all = [...value.items]
+          for (let nextPage = 1; nextPage <= value.totalPages; nextPage++) {
+            if (nextPage === chargerPage) continue
+            const next = await chargePointApi.listChargePoints(stationId!, nextPage, 20, controller.signal)
+            all.push(...next.items)
+          }
+          const query = chargerSearch.trim().toLocaleLowerCase('vi')
+          const matches = all.filter(item => `${item.code} ${item.name ?? ''}`.toLocaleLowerCase('vi').includes(query))
+          value = { ...value, items: matches, total: matches.length, totalPages: 1, page: 1 }
+        }
         if (!controller.signal.aborted) {
           setChargers(value)
           setError('')
@@ -405,18 +468,21 @@ export function OwnerWorkspace({
         running = false
       }
     }
-    void load()
+    const searchTimer = window.setTimeout(() => void load(), chargerSearch.trim() ? 250 : 0)
     const timer = window.setInterval(() => {
       if (!document.hidden && !form) void load()
     }, 5000)
     return () => {
       controller.abort()
+      window.clearTimeout(searchTimer)
       window.clearInterval(timer)
     }
-  }, [stationId, stationApi, chargePointApi, chargerPage, revision, form])
+  }, [stationId, stationApi, chargePointApi, chargerPage, chargerSearch, revision, form, area])
   function open(record: Station) {
+    window.location.assign(ownerHash(area, record.id))
     setStation(record)
     setChargers(null)
+    setChargerTotal(null)
     setSelected(null)
     setChargerPage(1)
     setChargerSearch('')
@@ -446,7 +512,7 @@ export function OwnerWorkspace({
           href="#stations"
           className="owner-brand"
           onClick={() => {
-            setArea('stations')
+            updateArea('stations')
             setStation(null)
             setForm(null)
             setMenu(false)
@@ -459,7 +525,7 @@ export function OwnerWorkspace({
           {navigation.map((item) => (
             <a
               key={item.area}
-              href={`#${item.area}`}
+              href={ownerHash(item.area, station?.id)}
               className={area === item.area ? 'is-active' : ''}
               aria-current={area === item.area ? 'page' : undefined}
               onClick={() => {
@@ -500,7 +566,22 @@ export function OwnerWorkspace({
         </header>
         {area === 'charging' ? (
           <OwnerCharging initialSessionId={sessionToOpen} onInitialSessionOpened={initialSessionOpened} />
-        ) : area !== 'stations' ? (
+        ) : area === 'power' ? (
+          <StationPowerPage />
+        ) : area === 'revenue' ? (
+          <section className="owner-page owner-revenue-page">
+            <header className="owner-heading">
+              <div>
+                <h1>Báo cáo doanh thu & sản lượng</h1>
+                <p>Theo dõi doanh thu hóa đơn, đối soát tiền ví và sản lượng kWh theo từng trụ.</p>
+              </div>
+            </header>
+            <OwnerRevenueReport
+              stations={stations?.items ?? []}
+              selectedStationId={station?.id}
+            />
+          </section>
+        ) : area !== 'stations' && area !== 'tariffs' && area !== 'subscriptions' ? (
           <section className="owner-page">
             <header className="owner-heading">
               <div>
@@ -509,19 +590,9 @@ export function OwnerWorkspace({
               </div>
             </header>
             <div className="owner-panel owner-placeholder owner-grow">
-              <Icon name={area === 'power' ? 'bolt' : 'report'} />
-              <h2>
-                {area === 'power'
-                  ? 'Chưa có chức năng cấu hình công suất'
-                  : area === 'tariffs'
-                    ? 'Chưa có chức năng biểu giá'
-                    : 'Chưa có báo cáo doanh thu'}
-              </h2>
-              <p>
-                {area === 'power'
-                  ? 'Thông số công suất danh định và số đo hiện có xem trong chi tiết đầu nối.'
-                  : 'Chức năng này sẽ khả dụng khi nghiệp vụ tương ứng được triển khai.'}
-              </p>
+              <Icon name="report" />
+              <h2>Chưa có báo cáo</h2>
+              <p>Chức năng này sẽ khả dụng khi nghiệp vụ tương ứng được triển khai.</p>
               <button
                 className="secondary-button"
                 onClick={() => setArea('stations')}
@@ -564,8 +635,9 @@ export function OwnerWorkspace({
               <div>
                 {station && (
                   <button
-                    className="text-button"
+                    className="navigation-link text-button"
                     onClick={() => {
+                      window.location.hash = ownerHash(area)
                       setStation(null)
                       setSelected(null)
                       setError('')
@@ -574,23 +646,26 @@ export function OwnerWorkspace({
                     Quay lại danh sách trạm
                   </button>
                 )}
-                <h1>{station?.name ?? 'Trạm của tôi'}</h1>
+                <h1>{area === 'tariffs' ? 'Biểu giá' : area === 'subscriptions' ? 'Gói thuê bao tháng' : station?.name ?? 'Trạm của tôi'}</h1>
                 <p>
-                  {station?.address ??
-                    'Nhận diện và quản lý từng trạm của bạn.'}
+                  {area === 'tariffs' || area === 'subscriptions' ? station?.name ?? 'Chọn trạm' : station?.address ?? ''}
                 </p>
               </div>
               <div className="owner-heading-actions">
                 {station ? (
                   <>
-                    <button
+                    {area === 'stations' && <StationOperation key={station.id} station={station} onChanged={(nextStatus, version) => {
+                      setStation({ ...station, status: nextStatus, statusVersion: version })
+                      setRevision(value => value + 1)
+                    }} onReload={() => setRevision(value => value + 1)} />}
+                    {area === 'stations' && <button
                       className="secondary-button"
                       onClick={() => setForm('edit-station')}
                     >
                       <Icon name="edit" />
                       Thông tin trạm
-                    </button>
-                    <button
+                    </button>}
+                    {area === 'stations' && <button
                       className="primary-button"
                       onClick={() => {
                         setEditingCharger(undefined)
@@ -599,9 +674,9 @@ export function OwnerWorkspace({
                     >
                       <Icon name="plus" />
                       Thêm trụ
-                    </button>
+                    </button>}
                   </>
-                ) : (
+                ) : area === 'stations' ? (
                   <button
                     className="primary-button"
                     onClick={() => setForm('create-station')}
@@ -609,9 +684,10 @@ export function OwnerWorkspace({
                     <Icon name="plus" />
                     Tạo trạm
                   </button>
-                )}
+                ) : null}
               </div>
             </header>
+            {area === 'stations' && <AlertsPanel area="owner" />}
             {notice && (
               <div role="status" className="owner-notice">
                 {notice}
@@ -649,7 +725,7 @@ export function OwnerWorkspace({
                       }}
                     />
                   </label>
-                  <label>
+                  {area === 'stations' && <label>
                     Trạng thái{' '}
                     <select
                       value={status}
@@ -668,7 +744,7 @@ export function OwnerWorkspace({
                         </option>
                       ))}
                     </select>
-                  </label>
+                  </label>}
                   <button
                     className="secondary-button"
                     onClick={() => setRevision((value) => value + 1)}
@@ -705,19 +781,19 @@ export function OwnerWorkspace({
                               name={record.name}
                             />
                             <div>
-                              <span
+                              {area === 'stations' && <span
                                 className={`owner-station-status status-${record.status}`}
                               >
                                 {statusLabel[record.status]}
-                              </span>
+                              </span>}
                               <h2>{record.name}</h2>
                               <p>{record.address}</p>
                               <button
                                 className="secondary-button"
-                                aria-label={`Xem chi tiết ${record.name}`}
+                                aria-label={`${area === 'tariffs' ? 'Xem biểu giá' : area === 'subscriptions' ? 'Quản lý gói thuê bao' : 'Xem chi tiết'} ${record.name}`}
                                 onClick={() => open(record)}
                               >
-                                Xem trạm
+                                {area === 'tariffs' ? 'Xem biểu giá' : area === 'subscriptions' ? 'Quản lý gói thuê bao' : 'Xem trạm'}
                                 <Icon name="chevronRight" />
                               </button>
                             </div>
@@ -767,14 +843,14 @@ export function OwnerWorkspace({
               </>
             ) : (
               <>
-                <div className="owner-toolbar owner-statusbar">
+                {area === 'stations' && <div className="owner-toolbar owner-statusbar">
                   <strong
                     className={`owner-station-status status-${station.status}`}
                   >
                     {statusLabel[station.status]}
                   </strong>
-                  <span>{chargers?.total ?? '—'} trụ</span>
-                  <div className="owner-legend">
+                  <span>{chargerTotal ?? '—'} trụ</span>
+                  {area === 'stations' && <div className="owner-legend">
                     {['available', 'charging', 'faulted', 'unknown'].map(
                       (key) => (
                         <span key={key} className={`connector-${key}`}>
@@ -783,47 +859,61 @@ export function OwnerWorkspace({
                         </span>
                       ),
                     )}
-                  </div>
-                </div>
-                {connectionError && (
+                  </div>}
+                </div>}
+                {area === 'stations' && connectionError && (
                   <p className="owner-subtle" role="status">
                     {connectionError}
                   </p>
                 )}
-                <div className="owner-detail-grid owner-grow">
+                {area === 'tariffs' ? <div className="owner-tariff-scroll owner-grow" role="region" aria-label="Biểu giá của trạm" tabIndex={0}>
+                  <TariffHistoryPanel key={station.id} stationId={String(station.id)} />
+                  <details className="owner-reservation-policy"><summary>Chính sách phí không đến</summary><ReservationPolicy key={station.id} stationId={String(station.id)} /></details>
+                </div> : area === 'subscriptions' ? <div className="owner-tariff-scroll owner-grow">
+                  <StationSubscriptionPlans key={station.id} stationId={String(station.id)} />
+                </div> : <div className="owner-detail-grid owner-grow">
                   <section className="owner-chargers">
                     <header>
                       <h2>Khu sạc</h2>
                       <input
                         type="search"
-                        aria-label="Tìm trụ trên trang"
-                        placeholder="Tìm trụ trên trang"
+                        aria-label="Tìm trụ trong trạm"
+                        placeholder="Tìm trụ trong trạm"
                         value={chargerSearch}
-                        onChange={(event) =>
+                        onChange={(event) => {
                           setChargerSearch(event.target.value)
-                        }
+                          setChargerPage(1)
+                          setChargers(null)
+                          setSelected(null)
+                        }}
                       />
                     </header>
                     <div className="owner-scroll owner-grow">
                       <div className="owner-charger-grid">
                         {chargers?.items
-                          .filter((item) =>
-                            `${item.code} ${item.name ?? ''}`
-                              .toLowerCase()
-                              .includes(chargerSearch.toLowerCase()),
-                          )
                           .map((charger) => {
                             const connection = connections.find(
                               (item) => item.id === charger.id,
                             )
+                            const defaultConnector = charger.connectors.find(item => item.connectorNumber === 1) ?? charger.connectors[0]
+                            const openCharger = () => {
+                              if (defaultConnector) setSelected({ charger, connector: defaultConnector })
+                            }
                             return (
                               <article
                                 key={charger.id}
                                 className={`owner-charger-card${selected?.charger.id === charger.id ? ' is-selected' : ''}`}
+                                onClick={(event) => {
+                                  if (!(event.target as HTMLElement).closest('button')) openCharger()
+                                }}
                               >
                                 <header>
-                                  <strong>
-                                    {charger.name || charger.code}
+                                  <strong title={charger.name || charger.code}>
+                                    <button type="button" className="owner-charger-open" disabled={!defaultConnector}
+                                      aria-label={`Xem trụ ${charger.name || charger.code}`}
+                                      onClick={openCharger}>
+                                      {charger.name || charger.code}
+                                    </button>
                                   </strong>
                                   <span
                                     className={`owner-connection ${connection?.online ? 'is-online' : ''}`}
@@ -891,7 +981,8 @@ export function OwnerWorkspace({
                             )
                           })}
                       </div>
-                      {chargers?.items.length === 0 && (
+                      {chargers?.items.length === 0 && chargerSearch.trim() && <p role="status">Không tìm thấy trụ khớp “{chargerSearch}” trong trạm này.</p>}
+                      {chargers?.items.length === 0 && !chargerSearch.trim() && (
                         <div className="owner-placeholder">
                           <h2>Chưa có trụ sạc</h2>
                           <p>
@@ -905,7 +996,7 @@ export function OwnerWorkspace({
                     </div>
                     <footer className="owner-charger-pagination">
                       <span>
-                        Trang {chargerPage} / {chargers?.totalPages || 1}
+                        {chargerSearch.trim() ? `${chargers?.total ?? '…'} trụ phù hợp` : `Trang ${chargerPage} / ${chargers?.totalPages || 1}`}
                       </span>
                       <button
                         disabled={chargerPage <= 1}
@@ -933,6 +1024,11 @@ export function OwnerWorkspace({
                     {selectedCharger && selectedConnector ? (
                       <>
                         <h2>{selectedCharger.name || selectedCharger.code}</h2>
+                        <p className="owner-full-code">Mã trụ: {selectedCharger.code}</p>
+                        <button type="button" className="secondary-button" onClick={async () => {
+                          try { await navigator.clipboard.writeText(selectedCharger.code); setNotice('Đã sao chép mã trụ.') }
+                          catch { setNotice('Không sao chép được. Bạn có thể chọn mã trụ phía trên để sao chép.') }
+                        }}>Sao chép mã trụ</button>
                         <p>Đầu nối {selectedConnector.connectorNumber}</p>
                         <p className="owner-contact"><ConnectionSymbol online={selectedConnection?.online} /> {selectedConnection ? selectedConnection.online ? 'Trực tuyến' : 'Ngoại tuyến' : 'Chưa có dữ liệu kết nối'}</p>
                         <p className="owner-subtle">Liên lạc cuối: {clock(selectedConnection?.last_seen_at ?? null)}</p>
@@ -951,11 +1047,11 @@ export function OwnerWorkspace({
                       <div className="owner-placeholder">
                         <Icon name="charger" />
                         <h2>Chọn một đầu nối</h2>
-                        <p>Xem số đo phiên sạc và thông số thiết bị tại đây.</p>
+
                       </div>
                     )}
                   </aside>
-                </div>
+                </div>}
               </>
             )}
           </section>

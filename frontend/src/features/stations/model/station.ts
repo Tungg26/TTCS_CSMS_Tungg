@@ -3,11 +3,13 @@ export type StationStatus = 'inactive' | 'active' | 'suspended' | 'blocked'
 export interface Station {
   photoUrl?: string | null
   id: string
+  timezone?: string
   name: string
   address: string
   latitude: number
   longitude: number
   status: StationStatus
+  statusVersion?: number
   createdAt: string
   updatedAt: string
 }

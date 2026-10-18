@@ -7,10 +7,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import delete, select
+from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
+from src.modules.charging.models import MeterSample
 from src.modules.charging.recovery import note_connector_status, note_reconnection
 from src.modules.charging.service import charging_call
 from src.modules.ocpp.connection_registry import OcppConnection
@@ -19,7 +20,7 @@ from src.modules.ocpp.models import OcppMessageReply
 from src.modules.ocpp.monitoring import (
     HeartbeatPayload,
     StatusPayload,
-    mark_seen,
+    lock_and_mark_seen,
     report_status,
 )
 from src.modules.stations.models import ChargePoint, Station
@@ -50,17 +51,20 @@ async def process_call(
 ) -> str:
     """Caller owns the transaction; the charger row serializes simultaneous repeats."""
     boot_was_accepted = connection.boot_accepted
-    charge_point = await session.scalar(
-        select(ChargePoint)
-        .where(ChargePoint.id == connection.charge_point_id)
-        .with_for_update()
-    )
+    if record_seen:
+        charge_point = await lock_and_mark_seen(session, connection.charge_point_id)
+    else:
+        charge_point = await session.scalar(
+            select(ChargePoint)
+            .where(ChargePoint.id == connection.charge_point_id)
+            .with_for_update()
+        )
     if charge_point is None or charge_point.archived_at is not None:
         return error_frame(
             frame.message_id, "SecurityError", "Charger registration is unavailable"
         )
-    if record_seen:
-        await mark_seen(session, charge_point.id, locked_charger=charge_point)
+    # Read the reply in a separate statement after the lock. A concurrent duplicate
+    # must see the first caller's committed reply even if it waited for that lock.
     # Admission belongs to this socket, even when the message has a durable reply.
     # Do not cache this denial: the same message may be replayed after a valid Boot.
     if frame.action != "BootNotification" and not connection.boot_accepted:
@@ -121,6 +125,7 @@ async def process_call(
                 await note_reconnection(session, charge_point.id)
         return cached.response
 
+    meter_rows: list[dict[str, object]] = []
     if frame.action == "BootNotification":
         try:
             boot = BootPayload.model_validate(frame.payload)
@@ -158,6 +163,15 @@ async def process_call(
             )
             connection.boot_accepted = accepted
             now = datetime.now(UTC)
+            from src.modules.ocpp.configuration_gate import (
+                reboot_heartbeat,
+                verified_heartbeat,
+            )
+
+            interval = await verified_heartbeat(
+                session, charge_point.id, settings.ocpp_heartbeat_interval_seconds
+            )
+            pending_interval = await reboot_heartbeat(session, charge_point.id)
             if accepted:
                 if not boot_was_accepted:
                     await note_reconnection(session, charge_point.id)
@@ -166,9 +180,8 @@ async def process_call(
                 if "firmwareVersion" in frame.payload:
                     charge_point.firmware_version = boot.firmwareVersion
                 charge_point.last_boot_at = now
-                charge_point.heartbeat_interval_seconds = (
-                    settings.ocpp_heartbeat_interval_seconds
-                )
+                if pending_interval is None:
+                    charge_point.heartbeat_interval_seconds = interval
                 charge_point.status = "online"
                 charge_point.status_updated_at = now
             else:
@@ -180,7 +193,9 @@ async def process_call(
                     {
                         "status": "Accepted" if accepted else "Rejected",
                         "currentTime": now.isoformat(),
-                        "interval": settings.ocpp_heartbeat_interval_seconds,
+                        "interval": pending_interval
+                        if pending_interval is not None
+                        else interval,
                     },
                 )
             )
@@ -200,12 +215,19 @@ async def process_call(
                 )
             else:
                 status = StatusPayload.model_validate_json(json.dumps(frame.payload))
-                await report_status(session, charge_point, status)
-                await note_connector_status(
-                    session, charge_point.id, status.connectorId, status.status
-                )
+                if await report_status(session, charge_point, status):
+                    await note_connector_status(
+                        session, charge_point.id, status.connectorId, status.status
+                    )
                 response = encode_frame(Frame(3, frame.message_id, {}))
         except (ValidationError, ValueError):
+            if frame.action == "StatusNotification":
+                # Do not log arbitrary values or payloads: malformed fields may
+                # contain identifiers, tokens or log-injection characters.
+                logger.warning(
+                    "ocpp_invalid_status_notification charger_id=%s",
+                    charge_point.id,
+                )
             response = error_frame(
                 frame.message_id,
                 "PropertyConstraintViolation",
@@ -222,7 +244,14 @@ async def process_call(
                 Frame(
                     3,
                     frame.message_id,
-                    await charging_call(session, charge_point, frame),
+                    await charging_call(
+                        session,
+                        charge_point,
+                        frame,
+                        deferred_meter_rows=meter_rows
+                        if frame.action == "MeterValues"
+                        else None,
+                    ),
                 )
             )
         except (ValidationError, ValueError):
@@ -241,14 +270,44 @@ async def process_call(
         response = error_frame(
             frame.message_id, "NotImplemented", "Action is not implemented"
         )
-    session.add(
-        OcppMessageReply(
+    if meter_rows:
+        # Data-modifying CTEs persist samples and their replay reply in one
+        # database round trip. Both still commit before transport sends the ACK.
+        statement = insert(OcppMessageReply).values(
             charge_point_id=charge_point.id,
             message_id=frame.message_id,
             request_hash=digest,
             response=response,
         )
-    )
+        for offset in range(0, len(meter_rows), 1024):
+            statement = statement.add_cte(
+                insert(MeterSample)
+                .values(meter_rows[offset : offset + 1024])
+                .cte(f"meter_batch_{offset}")
+            )
+        await session.execute(statement)
+    else:
+        session.add(
+            OcppMessageReply(
+                charge_point_id=charge_point.id,
+                message_id=frame.message_id,
+                request_hash=digest,
+                response=response,
+            )
+        )
+    if (
+        frame.action
+        in {
+            "BootNotification",
+            "StatusNotification",
+            "StartTransaction",
+            "StopTransaction",
+        }
+        and json.loads(response)[0] == 3
+    ):
+        from src.modules.power.service import note_power_event
+
+        await note_power_event(session, charge_point.station_id)
     await session.flush()
     return response
 

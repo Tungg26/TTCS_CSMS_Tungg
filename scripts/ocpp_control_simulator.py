@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_CEILING
 from pathlib import Path
 from time import monotonic
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from websockets.asyncio.client import connect
 
@@ -23,10 +23,49 @@ class ConnectorState:
     sample_count: int = 0
     fractional_wh: float = 0
     last_meter_at: float | None = None
+    default_limit_w: int | None = None
+    transaction_limit_w: int | None = None
+    default_profile_id: int | None = None
+    transaction_profile_id: int | None = None
+    reservation_id: int | None = None
+    reservation_tag: str | None = None
+    reservation_expires_at: datetime | None = None
 
-    def reserve_start(self) -> bool:
+    def expire_reservation(self) -> bool:
+        if self.reservation_expires_at and self.reservation_expires_at <= datetime.now(
+            UTC
+        ):
+            self.clear_reservation()
+            return True
+        return False
+
+    def clear_reservation(self) -> None:
+        self.reservation_id = None
+        self.reservation_tag = None
+        self.reservation_expires_at = None
+        if self.status == "Reserved":
+            self.status = "Available"
+
+    @property
+    def offered_watts(self) -> int | None:
+        return (
+            self.transaction_limit_w
+            if self.transaction_id is not None and self.transaction_limit_w is not None
+            else self.default_limit_w
+        )
+
+    def reserve_start(self, tag: str | None = None) -> bool:
+        self.expire_reservation()
         if (
-            self.status not in {"Available", "Preparing"}
+            (
+                self.status not in {"Available", "Preparing"}
+                and not (
+                    self.status == "Reserved"
+                    and self.reservation_id is not None
+                    and tag == self.reservation_tag
+                )
+            )
+            or (self.reservation_id is not None and tag != self.reservation_tag)
             or self.transaction_id is not None
             or self.starting
         ):
@@ -40,6 +79,8 @@ def meter_samples(
 ) -> list[dict[str, str]]:
     """Simulated telemetry, with energy integrated from the reported power."""
     watts = 7200 + (state.sample_count % 5) * 180
+    if state.offered_watts is not None:
+        watts = min(watts, state.offered_watts)
     energy = state.fractional_wh + watts * elapsed_seconds / 3600
     whole_wh = int(energy)
     state.meter_wh += whole_wh
@@ -145,8 +186,53 @@ async def run(
     connectors: dict[int, ConnectorState] | None = None,
     tag_connector: int = 1,
     stop_event: asyncio.Event | None = None,
+    profile_store: Path | None = None,
 ) -> None:
     states = connectors if connectors is not None else {1: ConnectorState()}
+    if profile_store is not None and profile_store.exists():
+        stored_profiles = json.loads(profile_store.read_text(encoding="utf-8"))
+        for number, state in states.items():
+            prior = stored_profiles.get(str(number), {})
+            state.default_limit_w = prior.get("default_limit_w")
+            state.default_profile_id = prior.get("default_profile_id")
+            if state.transaction_id is None and prior.get("reservation_id") is not None:
+                state.reservation_id = prior["reservation_id"]
+                state.reservation_tag = prior["reservation_tag"]
+                state.reservation_expires_at = datetime.fromisoformat(
+                    prior["reservation_expires_at"]
+                )
+                state.status = "Reserved"
+                state.expire_reservation()
+            if prior.get("transaction_id") == state.transaction_id:
+                state.transaction_limit_w = prior.get("transaction_limit_w")
+                state.transaction_profile_id = prior.get("transaction_profile_id")
+
+    def persist_profiles() -> None:
+        if profile_store is None:
+            return
+        profile_store.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            str(number): {
+                "default_limit_w": state.default_limit_w,
+                "default_profile_id": state.default_profile_id,
+                "transaction_id": state.transaction_id,
+                "transaction_limit_w": state.transaction_limit_w,
+                "transaction_profile_id": state.transaction_profile_id,
+                "reservation_id": state.reservation_id,
+                "reservation_tag": state.reservation_tag,
+                "reservation_expires_at": state.reservation_expires_at.isoformat()
+                if state.reservation_expires_at
+                else None,
+            }
+            for number, state in states.items()
+        }
+        pending_file = profile_store.with_suffix(".tmp")
+        # Reservation tags are private device state, never a world-readable demo artifact.
+        pending_file.touch(mode=0o600, exist_ok=True)
+        pending_file.chmod(0o600)
+        pending_file.write_text(json.dumps(payload), encoding="utf-8")
+        pending_file.replace(profile_store)
+
     if existing_transaction_id is not None:
         if connectors is None:
             states[tag_connector].transaction_id = existing_transaction_id
@@ -180,6 +266,7 @@ async def run(
                 "StatusNotification",
                 {
                     "connectorId": number,
+                    "timestamp": datetime.now(UTC).isoformat(),
                     "status": state.status,
                     "errorCode": "OtherError"
                     if state.status == "Faulted"
@@ -202,6 +289,9 @@ async def run(
                     },
                 )
                 state.transaction_id = None
+                state.transaction_limit_w = None
+                state.transaction_profile_id = None
+                persist_profiles()
                 state.status = "Available"
                 await report(number)
                 print(
@@ -221,14 +311,26 @@ async def run(
                             "idTag": raw_tag,
                             "meterStart": state.meter_wh,
                             "timestamp": datetime.now(UTC).isoformat(),
+                            **(
+                                {"reservationId": state.reservation_id}
+                                if state.reservation_id is not None
+                                else {}
+                            ),
                         },
                     )
                     value = result.get("transactionId")
                     if not isinstance(value, int):
                         raise TypeError("StartTransaction returned no transaction ID")
+                    if value <= 0:
+                        state.transaction_id = None
+                        state.status = "Available"
+                        await report(number)
+                        return
                     state.transaction_id = value
                     authorized = result.get("idTagInfo", {}).get("status") == "Accepted"
                     if authorized:
+                        state.clear_reservation()
+                        persist_profiles()
                         state.status = "Charging"
                         state.last_meter_at = monotonic()
                         await report(number)
@@ -269,6 +371,209 @@ async def run(
                     if outcome == "Timeout":
                         continue
                     number = payload.get("connectorId")
+                    if action == "GetConfiguration":
+                        values = {
+                            "SupportedFeatureProfiles": "Core,SmartCharging,Reservation",
+                            "ChargingScheduleAllowedChargingRateUnit": "Power",
+                            "ChargeProfileMaxStackLevel": "1",
+                        }
+                        await socket.send(
+                            json.dumps(
+                                [
+                                    3,
+                                    frame[1],
+                                    {
+                                        "configurationKey": [
+                                            {
+                                                "key": key,
+                                                "readonly": True,
+                                                "value": value,
+                                            }
+                                            for key, value in values.items()
+                                        ]
+                                    },
+                                ]
+                            )
+                        )
+                        continue
+                    if action == "ReserveNow":
+                        result = "Rejected"
+                        if (
+                            type(number) is int
+                            and number in states
+                            and outcome == "Accepted"
+                        ):
+                            state = states[number]
+                            state.expire_reservation()
+                            try:
+                                expiry = datetime.fromisoformat(payload["expiryDate"])
+                                valid = (
+                                    expiry.tzinfo is not None
+                                    and expiry > datetime.now(UTC)
+                                    and type(payload.get("reservationId")) is int
+                                    and payload["reservationId"] > 0
+                                    and isinstance(payload.get("idTag"), str)
+                                    and 0 < len(payload["idTag"]) <= 20
+                                )
+                            except (KeyError, TypeError, ValueError, AttributeError):
+                                valid = False
+                            if state.status == "Faulted":
+                                result = "Faulted"
+                            elif (
+                                state.transaction_id is not None
+                                or state.starting
+                                or state.reservation_id is not None
+                                or state.status not in {"Available", "Preparing"}
+                            ):
+                                result = "Occupied"
+                            elif valid:
+                                state.reservation_id = payload["reservationId"]
+                                state.reservation_tag = payload["idTag"]
+                                state.reservation_expires_at = expiry
+                                state.status = "Reserved"
+                                persist_profiles()
+                                result = "Accepted"
+                        await socket.send(json.dumps([3, frame[1], {"status": result}]))
+                        if result == "Accepted":
+                            schedule(asyncio.create_task(report(number)))
+                        continue
+                    if action == "CancelReservation":
+                        target = next(
+                            (
+                                n
+                                for n, s in states.items()
+                                if s.reservation_id is not None
+                                and s.reservation_id == payload.get("reservationId")
+                            ),
+                            None,
+                        )
+                        accepted = outcome == "Accepted" and target is not None
+                        if accepted:
+                            states[target].clear_reservation()
+                            persist_profiles()
+                        await socket.send(
+                            json.dumps(
+                                [
+                                    3,
+                                    frame[1],
+                                    {"status": "Accepted" if accepted else "Rejected"},
+                                ]
+                            )
+                        )
+                        if accepted:
+                            schedule(asyncio.create_task(report(target)))
+                        continue
+                    if action == "SetChargingProfile":
+                        accepted = False
+                        details = payload.get("csChargingProfiles", {})
+                        if (
+                            outcome == "Accepted"
+                            and type(number) is int
+                            and number in states
+                            and isinstance(details, dict)
+                        ):
+                            charge_schedule = details.get("chargingSchedule", {})
+                            periods = (
+                                charge_schedule.get("chargingSchedulePeriod", [])
+                                if isinstance(charge_schedule, dict)
+                                else []
+                            )
+                            if (
+                                charge_schedule.get("chargingRateUnit") == "W"
+                                and len(periods) == 1
+                                and periods[0].get("startPeriod") == 0
+                                and type(periods[0].get("limit")) is int
+                                and periods[0]["limit"] >= 0
+                            ):
+                                state = states[number]
+                                if (
+                                    state.transaction_id is not None
+                                    and state.status == "Charging"
+                                    and state.last_meter_at is not None
+                                ):
+                                    tick = monotonic()
+                                    meter_samples(state, tick - state.last_meter_at)
+                                    state.last_meter_at = tick
+                                purpose = details.get("chargingProfilePurpose")
+                                if purpose == "TxDefaultProfile":
+                                    state.default_limit_w = periods[0]["limit"]
+                                    state.default_profile_id = details[
+                                        "chargingProfileId"
+                                    ]
+                                    accepted = True
+                                elif (
+                                    purpose == "TxProfile"
+                                    and details.get("transactionId")
+                                    == state.transaction_id
+                                    and state.transaction_id is not None
+                                ):
+                                    state.transaction_limit_w = periods[0]["limit"]
+                                    state.transaction_profile_id = details[
+                                        "chargingProfileId"
+                                    ]
+                                    accepted = True
+                        if accepted:
+                            persist_profiles()
+                        await socket.send(
+                            json.dumps(
+                                [
+                                    3,
+                                    frame[1],
+                                    {
+                                        "status": "Accepted"
+                                        if accepted and outcome == "Accepted"
+                                        else "Rejected"
+                                    },
+                                ]
+                            )
+                        )
+                        continue
+                    if action == "GetCompositeSchedule":
+                        if type(number) is int and number in states:
+                            state = states[number]
+                            response = {
+                                "status": "Accepted",
+                                "connectorId": number,
+                                "scheduleStart": datetime.now(UTC).isoformat(),
+                                "chargingSchedule": {
+                                    "duration": 60,
+                                    "chargingRateUnit": "W",
+                                    "chargingSchedulePeriod": [
+                                        {
+                                            "startPeriod": 0,
+                                            "limit": state.offered_watts
+                                            if state.offered_watts is not None
+                                            else 7200,
+                                        }
+                                    ],
+                                },
+                            }
+                        else:
+                            response = {"status": "Rejected"}
+                        await socket.send(json.dumps([3, frame[1], response]))
+                        continue
+                    if action == "ClearChargingProfile":
+                        cleared = False
+                        for state in states.values():
+                            if payload.get("id") == state.default_profile_id:
+                                state.default_profile_id = None
+                                state.default_limit_w = None
+                                cleared = True
+                            if payload.get("id") == state.transaction_profile_id:
+                                state.transaction_profile_id = None
+                                state.transaction_limit_w = None
+                                cleared = True
+                        await socket.send(
+                            json.dumps(
+                                [
+                                    3,
+                                    frame[1],
+                                    {"status": "Accepted" if cleared else "Unknown"},
+                                ]
+                            )
+                        )
+                        persist_profiles()
+                        continue
                     stop_number = next(
                         (
                             n
@@ -290,7 +595,7 @@ async def run(
                             outcome == "Accepted"
                             and type(number) is int
                             and number in states
-                            and states[number].reserve_start()
+                            and states[number].reserve_start(payload.get("idTag"))
                         )
                     await socket.send(
                         json.dumps(
@@ -344,6 +649,10 @@ async def run(
                 flush=True,
             )
             while stop_event is None or not stop_event.is_set():
+                for number, state in states.items():
+                    if state.expire_reservation():
+                        persist_profiles()
+                        await report(number)
                 await call("Heartbeat", {})
                 for number, state in states.items():
                     async with locks[number]:
@@ -401,6 +710,10 @@ async def main(args: argparse.Namespace) -> None:
         args.start_delay,
         connectors,
         args.connector,
+        profile_store=Path(args.profile_store)
+        if args.profile_store
+        else Path(".local")
+        / f"control-power-{uuid5(NAMESPACE_URL, args.code).hex}.json",
     )
 
 
@@ -408,6 +721,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="ws://127.0.0.1:8001")
     parser.add_argument("--code", required=True)
+    parser.add_argument(
+        "--profile-store",
+        help="Durable profile state file (default: a distinct .local file per charger code)",
+    )
     parser.add_argument(
         "--connector",
         type=int,

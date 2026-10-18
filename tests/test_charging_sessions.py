@@ -3,6 +3,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from time import perf_counter
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import httpx
@@ -10,6 +11,7 @@ import pytest
 from sqlalchemy import delete, func, select
 
 from src.entrypoints.http import app
+from src.modules import charging as charging_module
 from src.modules.charging.models import (
     AuthorizationAttempt,
     ChargingCard,
@@ -25,6 +27,8 @@ from src.modules.ocpp.dispatcher import dispatch_call, process_call
 from src.modules.ocpp.frames import Frame, decode_frame
 from src.modules.ocpp.transport import handle_message
 from src.modules.stations.models import ChargePoint, Connector, Station
+from src.modules.wallet.eligibility import ChargingEligibility
+from src.modules.wallet.models import Wallet
 from src.platform.database.session import SessionFactory, get_db_session
 from tests.test_ocpp_foundation import charger_fixture, connection
 
@@ -57,6 +61,47 @@ async def test_start_replay_on_new_connection_keeps_exact_transaction(db_session
     )
 
 
+@pytest.mark.asyncio
+async def test_real_start_invalidates_old_power_confirmation_but_replay_does_not(
+    db_session,
+):
+    from src.modules.power.models import ConnectorPower, StationPower
+
+    station, charger, connector, _, _, conn, tag = await setup(db_session)
+    charger.last_boot_at = datetime.now(UTC)
+    db_session.add(
+        StationPower(
+            station_id=station.id,
+            limit_w=30000,
+            applied_limit_w=30000,
+            enabled=True,
+            target_enabled=True,
+            state="ready",
+        )
+    )
+    await db_session.flush()
+    cap = ConnectorPower(
+        connector_id=connector.id,
+        station_id=station.id,
+        rated_w=22000,
+        confirmed_w=7000,
+        reserved_w=7000,
+        baseline_boot_at=charger.last_boot_at,
+    )
+    db_session.add(cap)
+    await db_session.flush()
+    stamp = datetime.now(UTC)
+    uid = str(uuid4())
+    first = await start(db_session, conn, tag, stamp, uid=uid)
+    assert first.payload["idTagInfo"]["status"] == "Accepted"
+    assert cap.confirmed_w == 0 and cap.reserved_w == 7000
+    cap.confirmed_w = 7000  # Simulate a later verified worker readback.
+    await db_session.flush()
+    replay = await start(db_session, conn, tag, stamp, uid=uid)
+    assert replay.payload == first.payload
+    assert cap.confirmed_w == cap.reserved_w == 7000
+
+
 async def setup(session):
     station, charger = await charger_fixture(session)
     connector = Connector(
@@ -70,6 +115,7 @@ async def setup(session):
         session.add(role)
     await session.flush()
     session.add(UserRole(user_id=driver.id, role_id=role.id))
+    session.add(Wallet(driver_id=driver.id, balance_vnd=1_000_000, status="active"))
     card = ChargingCard(
         tag_hash=tag_hash(TAG + str(charger.id)),
         tag_tail="ABCD",
@@ -162,6 +208,68 @@ async def test_authorize_states_and_masked_audit(
         )
     )
     assert attempt.result == expected and attempt.tag_tail == tag[-4:]
+
+
+@pytest.mark.asyncio
+async def test_authorize_blocks_driver_with_ineligible_wallet(db_session, monkeypatch):
+    _, _, _, driver, _, conn, tag = await setup(db_session)
+    check_wallet = AsyncMock(
+        return_value=ChargingEligibility(False, "wallet_low", 0, 12500, None)
+    )
+    monkeypatch.setattr(charging_module.service, "du_so_du_de_sac", check_wallet)
+
+    reply = await call(db_session, conn, "Authorize", {"idTag": tag})
+
+    assert reply.payload["idTagInfo"]["status"] == "Blocked"
+    attempt = await db_session.scalar(
+        select(AuthorizationAttempt).where(
+            AuthorizationAttempt.charge_point_id == conn.charge_point_id
+        )
+    )
+    assert attempt.result == "Blocked"
+    check_wallet.assert_awaited_once()
+    assert check_wallet.await_args.kwargs == {
+        "driver_id": driver.id,
+        "station_id": conn.station_id,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    ["wallet_low", "wallet_missing", "wallet_locked", "tariff_unavailable"],
+)
+async def test_start_blocks_and_records_wallet_rejection(
+    db_session, monkeypatch, reason
+):
+    _, charger, _, _, _, conn, tag = await setup(db_session)
+    check_wallet = AsyncMock(
+        return_value=ChargingEligibility(False, reason, None, None, None)
+    )
+    monkeypatch.setattr(charging_module.service, "du_so_du_de_sac", check_wallet)
+
+    reply = await start(db_session, conn, tag)
+
+    assert reply.kind == 3
+    assert reply.payload == {
+        "transactionId": 0,
+        "idTagInfo": {"status": "Blocked"},
+    }
+    pending_message = await db_session.scalar(
+        select(PendingChargingMessage).where(
+            PendingChargingMessage.charge_point_id == charger.id
+        )
+    )
+    assert pending_message.action == "StartTransaction"
+    assert pending_message.reason == reason
+    assert (
+        await db_session.scalar(
+            select(func.count())
+            .select_from(ChargingSession)
+            .where(ChargingSession.charge_point_id == charger.id)
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio
@@ -504,6 +612,7 @@ async def test_api_owner_scope_cards_samples_pending_and_driver_denied(db_sessio
         ) as client:
             own = await client.get("/api/v1/charging/sessions")
             assert own.status_code == 200 and own.json()["items"][0]["id"] == tid
+            assert own.json()["items"][0]["station_id"] == str(station.id)
             assert tag not in own.text
             assert (
                 await client.get(f"/api/v1/charging/sessions/{tid}/samples")
@@ -677,3 +786,133 @@ async def test_zero_unknown_transaction_is_pending_not_protocol_error(db_session
         )
         == 1
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovering", [False, True])
+async def test_meter_batch_and_reply_rollback_together_then_retry(
+    db_session, monkeypatch, recovering
+):
+    from src.modules.ocpp.models import OcppMessageReply
+
+    _, charger, _, _, _, conn, tag = await setup(db_session)
+    stamp = datetime.now(UTC)
+    tid = (await start(db_session, conn, tag, stamp)).payload["transactionId"]
+    payload = meter_payload(tid, stamp + timedelta(seconds=10), 2000)
+    payload["meterValue"][0]["sampledValue"].extend(
+        [
+            {"measurand": "Power.Active.Import", "value": "7200"},
+            {"measurand": "Voltage", "value": "230"},
+            {"measurand": "Current.Import", "value": "32"},
+        ]
+    )
+    if recovering:
+        transaction = await db_session.get(ChargingSession, tid)
+        transaction.recovery_at = stamp
+        await db_session.flush()
+    uid = str(uuid4())
+
+    async def fail_flush(*args, **kwargs):
+        raise RuntimeError("reply persistence failed")
+
+    with pytest.raises(RuntimeError, match="reply persistence failed"):
+        async with db_session.begin_nested():
+            with monkeypatch.context() as patch:
+                patch.setattr(db_session, "flush", fail_flush)
+                await call(db_session, conn, "MeterValues", payload, uid)
+    assert (
+        await db_session.scalar(
+            select(func.count())
+            .select_from(MeterSample)
+            .where(MeterSample.session_id == tid)
+        )
+        == 0
+    )
+    assert await db_session.get(OcppMessageReply, (charger.id, uid)) is None
+    reply = await call(db_session, conn, "MeterValues", payload, uid)
+    assert reply.kind == 3
+    assert (
+        await call(db_session, conn, "MeterValues", payload, uid)
+    ).payload == reply.payload
+    assert (
+        await db_session.scalar(
+            select(func.count())
+            .select_from(MeterSample)
+            .where(MeterSample.session_id == tid)
+        )
+        == 4
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_meter_calls_share_committed_samples_and_reply():
+    from src.modules.ocpp.models import OcppMessageReply
+
+    async with SessionFactory() as session, session.begin():
+        station, charger = await charger_fixture(session)
+        station_id, charger_id, owner_id = station.id, charger.id, station.owner_id
+        connector = Connector(charge_point_id=charger.id, connector_number=1)
+        session.add(connector)
+        await session.flush()
+        transaction = ChargingSession(
+            charge_point_id=charger.id,
+            connector_id=connector.id,
+            tag_tail="TEST",
+            authorization_status="Invalid",
+            started_at=datetime.now(UTC) - timedelta(seconds=30),
+            meter_start_wh=Decimal(1000),
+            review_reasons=[],
+            recovery_at=datetime.now(UTC),
+        )
+        session.add(transaction)
+        await session.flush()
+        tid = transaction.id
+    try:
+        frame = Frame(
+            2,
+            str(uuid4()),
+            meter_payload(tid, datetime.now(UTC), 2000),
+            action="MeterValues",
+        )
+
+        async def deliver():
+            conn = connection(charger_id, station_id)
+            conn.boot_accepted = True
+            return await dispatch_call(conn, frame, record_seen=True)
+
+        first, second = await asyncio.gather(deliver(), deliver())
+        assert first == second == await deliver()
+        assert decode_frame(first).kind == 3
+        async with SessionFactory() as session:
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(MeterSample)
+                    .where(MeterSample.session_id == tid)
+                )
+                == 1
+            )
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(OcppMessageReply)
+                    .where(
+                        OcppMessageReply.charge_point_id == charger_id,
+                        OcppMessageReply.message_id == frame.message_id,
+                    )
+                )
+                == 1
+            )
+    finally:
+        async with SessionFactory() as session, session.begin():
+            await session.execute(
+                delete(ChargingSession).where(ChargingSession.id == tid)
+            )
+            await session.execute(
+                delete(Connector).where(Connector.charge_point_id == charger_id)
+            )
+            await session.execute(
+                delete(ChargePoint).where(ChargePoint.id == charger_id)
+            )
+            await session.execute(delete(Station).where(Station.id == station_id))
+            await session.execute(delete(User).where(User.id == owner_id))

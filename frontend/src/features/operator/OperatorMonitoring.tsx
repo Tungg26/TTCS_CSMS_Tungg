@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
+import { AlertsPanel } from "../alerts/AlertsPanel";
 import { notifySessionUnauthorized } from "../auth/sessionEvents";
 import { ControlAction } from "../ocpp/ControlAction";
+import { ChargerConfiguration } from './ChargerConfiguration';
 import {
   ChargerDrawing,
   ConnectionSymbol,
@@ -146,6 +148,7 @@ function ConnectorSession({
       {!data && !error && <p role="status">Đang tải số đo…</p>}
       {data && (
         <>
+          {!charger.online && <p className="operator-stale-reading">Trụ ngoại tuyến · số đo dưới đây là lần cuối nhận được, không phải số đo trực tiếp.</p>}
           {error && <p>Dữ liệu lần tải trước có thể đã cũ.</p>}
           {data.session ? (
             <>
@@ -227,8 +230,10 @@ function ConnectorSession({
 }
 export function OperatorMonitoring({
   onOpenSession,
+  canConfigure = false,
 }: {
   onOpenSession: (id: number) => void;
+  canConfigure?: boolean;
 }) {
   const [result, setResult] = useState<Result | null>(null);
   const [page, setPage] = useState(1);
@@ -239,10 +244,29 @@ export function OperatorMonitoring({
   const [streamState, setStreamState] = useState("Đang nối luồng cập nhật…");
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
-  const [selection, setSelection] = useState<{
+  const [selection, updateSelection] = useState<{
     id: string;
     number: number;
-  } | null>(null);
+  } | null>(() => {
+    const params = new URLSearchParams(window.location.hash.split("?")[1]);
+    const id = params.get("charger");
+    return id ? { id, number: Number(params.get("connector")) || 1 } : null;
+  });
+  function setSelection(next: { id: string; number: number } | null) {
+    const params = new URLSearchParams();
+    if (next) { params.set("charger", next.id); params.set("connector", String(next.number)); }
+    window.history.pushState(null, "", `#ops-monitor${next ? `?${params}` : ""}`);
+    updateSelection(next);
+  }
+  useEffect(() => {
+    const change = () => {
+      const params = new URLSearchParams(window.location.hash.split("?")[1]);
+      const id = params.get("charger");
+      updateSelection(id ? { id, number: Number(params.get("connector")) || 1 } : null);
+    };
+    window.addEventListener("hashchange", change);
+    return () => window.removeEventListener("hashchange", change);
+  }, []);
   useEffect(() => {
     let stopped = false;
     let controller: AbortController | undefined;
@@ -366,7 +390,6 @@ export function OperatorMonitoring({
       <header className="owner-heading">
         <div>
           <h1>Giám sát trụ</h1>
-          <p>Toàn hệ thống · ưu tiên trụ cần chú ý.</p>
         </div>
         <button
           className="secondary-button"
@@ -375,6 +398,7 @@ export function OperatorMonitoring({
           Cập nhật ngay
         </button>
       </header>
+      <AlertsPanel area="ops" />
       <p className="operator-stream" role="status">
         {streamState}
         {updatedAt && ` · ${clock(updatedAt)}`}
@@ -402,6 +426,7 @@ export function OperatorMonitoring({
           {visible.length} / {result?.total ?? 0} trụ
         </span>
       </div>
+      <p className="operator-filter-scope">Bộ lọc áp dụng trong trang hiện tại.</p>
       {error && (
         <p role="alert" className="owner-error">
           {error} {result && "Dữ liệu có thể đã cũ."}
@@ -493,7 +518,7 @@ export function OperatorMonitoring({
           {selected ? (
             <>
               <button
-                className="text-button operator-detail-back"
+                className="navigation-link text-button operator-detail-back"
                 onClick={() => setSelection(null)}
               >
                 Quay lại trụ
@@ -536,6 +561,7 @@ export function OperatorMonitoring({
                 chargerId={selected.id}
                 label={selected.code}
               />
+              <ChargerConfiguration key={selected.id} chargerId={selected.id} allowed={canConfigure} />
               <details>
                 <summary>Thông tin trụ và kết nối</summary>
                 <p>
